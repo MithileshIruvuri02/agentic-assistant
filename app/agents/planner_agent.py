@@ -1,6 +1,7 @@
 import json
 import re
 from typing import Dict, Any
+
 from groq import Groq
 from loguru import logger
 import tiktoken
@@ -11,175 +12,192 @@ from app.config import get_settings
 
 class PlannerAgent:
     """
-    Planner agent using Groq (FREE!) for intent understanding and planning.
+    Planner agent using Groq (FREE) for intent understanding and execution planning.
+    Enforces grounding rules to prevent hallucinations.
     """
-    
+
     def __init__(self):
         self.settings = get_settings()
         self.client = Groq(api_key=self.settings.GROQ_API_KEY)
         self.encoder = tiktoken.encoding_for_model("gpt-4")
-    
+
     async def create_plan(
-        self, 
+        self,
         extracted_content: ExtractedContent,
-        user_clarification: str = None
+        user_clarification: str | None = None,
     ) -> ExecutionPlan:
         """
-        Analyze extracted content and create execution plan using Groq (FREE).
+        Create an execution plan based on extracted content.
         """
-        logger.info("Planning task execution with Groq (FREE)")
-        
-        # Build context for LLM
+
+        logger.info("🧠 PlannerAgent: Creating execution plan")
+
+        # 🚨 HARD GUARD: YouTube transcript failed
+        if extracted_content.extraction_method == "youtube_failed":
+            logger.warning("🚫 YouTube transcript unavailable — blocking summarization")
+
+            return ExecutionPlan(
+                task_type=TaskType.CLARIFICATION_NEEDED,
+                steps=[],
+                estimated_tokens=0,
+                estimated_cost=0.0,
+                requires_clarification=True,
+                clarification_question=(
+                    "I couldn’t access captions for this YouTube video. "
+                    "Please upload the transcript, enable captions, or upload the audio/video file."
+                ),
+                reasoning="YouTube transcript extraction failed; summarization would be ungrounded.",
+                metadata={
+                    "blocked": True,
+                    "reason": "youtube_transcript_unavailable",
+                    "free_api": True,
+                },
+            )
+
+        # Build LLM context
         context = self._build_context(extracted_content, user_clarification)
-        
-        # Get plan from Groq
-        plan_response = await self._get_llm_plan(context)
-        
-        # Parse and validate plan
-        execution_plan = self._parse_plan(plan_response, extracted_content)
-        
-        logger.info(f"Plan created: {execution_plan.task_type}, steps: {len(execution_plan.steps)}")
-        
+
+        # Ask Groq for intent
+        plan_data = await self._get_llm_plan(context)
+
+        # Parse into ExecutionPlan
+        execution_plan = self._parse_plan(plan_data, extracted_content)
+
+        logger.info(
+            f"✅ Plan finalized | task={execution_plan.task_type} | tokens={execution_plan.estimated_tokens}"
+        )
+
         return execution_plan
-    
-    def _build_context(self, content: ExtractedContent, clarification: str = None) -> str:
-        """Build context string for LLM planning."""
-        context = f"""Analyze this content and determine the user's intent.
+
+    def _build_context(
+        self,
+        content: ExtractedContent,
+        clarification: str | None = None,
+    ) -> str:
+        """
+        Build prompt context for the planner LLM.
+        """
+
+        context = f"""
+Analyze the user's intent strictly based on AVAILABLE content.
 
 INPUT TYPE: {content.input_type}
 EXTRACTION METHOD: {content.extraction_method}
 CONTENT LENGTH: {len(content.text)} characters
 
-CONTENT:
+CONTENT (may be empty):
 {content.text[:2000]}{"..." if len(content.text) > 2000 else ""}
 
-METADATA: {json.dumps(content.metadata, indent=2)}
+METADATA:
+{json.dumps(content.metadata, indent=2)}
 """
-        
+
         if clarification:
-            context += f"\n\nUSER CLARIFICATION: {clarification}"
-        
-        return context
-    
+            context += f"\n\nUSER CLARIFICATION:\n{clarification}"
+
+        return context.strip()
+
     async def _get_llm_plan(self, context: str) -> Dict[str, Any]:
-        """Get execution plan from Groq (FREE)."""
-        
-        system_prompt = """You are a planning agent that determines user intent and creates execution plans.
+        """
+        Ask Groq to determine user intent and planning steps.
+        """
+
+        system_prompt = """
+You are a planning agent.
+
+CRITICAL RULES (MUST FOLLOW):
+- NEVER summarize content that is empty or unavailable
+- NEVER hallucinate missing information
+- If text length is 0 and user asks to summarize → clarification_needed
+- If extraction method indicates failure → clarification_needed
 
 AVAILABLE TASK TYPES:
-- text_extraction: User wants to see extracted/transcribed text
-- youtube_transcript: User wants YouTube video transcript
-- summarization: User wants summary (1-line + 3 bullets + 5 sentences)
-- sentiment_analysis: User wants sentiment analysis (label + confidence + justification)
-- code_explanation: User wants code explained (language + explanation + bugs + complexity)
-- conversational: User is asking questions or having a conversation
-- clarification_needed: Intent is unclear
+- text_extraction
+- youtube_transcript
+- summarization
+- sentiment_analysis
+- code_explanation
+- conversational
+- clarification_needed
 
-CLARIFICATION RULES:
-- If input is JUST text extraction with no specific request, ask what they want
-- If multiple tasks are equally plausible, ask which they prefer
-- If there are explicit instructions or clear context, proceed without asking
-- If content has code and user says "explain", do code_explanation
-- If user says "summarize" or "summary", do summarization
-- If user asks about sentiment/feeling/emotion, do sentiment_analysis
-
-Respond ONLY with valid JSON (no markdown):
+Respond ONLY with valid JSON:
 {
-  "task_type": "one of the task types above",
-  "reasoning": "why you chose this task",
-  "requires_clarification": true or false,
-  "clarification_question": "question if needed, else null",
+  "task_type": "...",
+  "reasoning": "...",
+  "requires_clarification": true/false,
+  "clarification_question": "... or null",
   "suggested_steps": ["step 1", "step 2"]
-}"""
+}
+"""
+
+        response = self.client.chat.completions.create(
+            model=self.settings.GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": context},
+            ],
+            temperature=0.2,
+            max_tokens=800,
+        )
+
+        raw_text = response.choices[0].message.content.strip()
+        logger.debug(f"📥 Planner raw response: {raw_text[:300]}")
+
+        # Remove markdown if present
+        raw_text = re.sub(r"```(?:json)?", "", raw_text).strip()
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.settings.GROQ_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": context}
-                ],
-                temperature=0.3,
-                max_tokens=1000
-            )
-            
-            response_text = response.choices[0].message.content.strip()
-            logger.debug(f"Groq planner response: {response_text[:200]}...")
-            
-            # Parse JSON - handle markdown
-            json_match = re.search(r'```json\s*(\{.*?\})\s*```', response_text, re.DOTALL)
-            if json_match:
-                response_text = json_match.group(1)
-            elif '```' in response_text:
-                response_text = re.sub(r'```\w*\n?', '', response_text).strip()
-            
-            # Find JSON object
-            if not response_text.startswith('{'):
-                json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-                if json_match:
-                    response_text = json_match.group(0)
-            
-            plan_data = json.loads(response_text)
-            
-            # Set defaults
-            plan_data.setdefault('requires_clarification', False)
-            plan_data.setdefault('clarification_question', None)
-            plan_data.setdefault('suggested_steps', ['Process content'])
-            
-            return plan_data
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse Groq response: {e}")
-            logger.debug(f"Response text: {response_text}")
-            
-            # Default fallback
+            return json.loads(raw_text)
+        except json.JSONDecodeError:
+            logger.error("❌ Planner JSON parse failed — defaulting to clarification")
             return {
-                "task_type": "conversational",
-                "reasoning": "Failed to parse plan, defaulting to conversational",
-                "requires_clarification": False,
-                "suggested_steps": ["Provide a helpful response"]
+                "task_type": "clarification_needed",
+                "reasoning": "Failed to parse planner response",
+                "requires_clarification": True,
+                "clarification_question": "Could you clarify what you'd like me to do?",
+                "suggested_steps": [],
             }
-        except Exception as e:
-            logger.error(f"Failed to get plan from Groq: {e}")
-            raise
-    
-    def _parse_plan(self, plan_data: Dict[str, Any], content: ExtractedContent) -> ExecutionPlan:
-        """Parse LLM response into ExecutionPlan object."""
-        
-        # Map task type string to enum
-        task_type_map = {
+
+    def _parse_plan(
+        self,
+        plan_data: Dict[str, Any],
+        content: ExtractedContent,
+    ) -> ExecutionPlan:
+        """
+        Convert planner JSON into ExecutionPlan.
+        """
+
+        task_map = {
             "text_extraction": TaskType.TEXT_EXTRACTION,
             "youtube_transcript": TaskType.YOUTUBE_TRANSCRIPT,
             "summarization": TaskType.SUMMARIZATION,
             "sentiment_analysis": TaskType.SENTIMENT_ANALYSIS,
             "code_explanation": TaskType.CODE_EXPLANATION,
             "conversational": TaskType.CONVERSATIONAL,
-            "clarification_needed": TaskType.CLARIFICATION_NEEDED
+            "clarification_needed": TaskType.CLARIFICATION_NEEDED,
         }
-        
-        task_type = task_type_map.get(
-            plan_data.get("task_type", "conversational"),
-            TaskType.CONVERSATIONAL
+
+        task_type = task_map.get(
+            plan_data.get("task_type"),
+            TaskType.CONVERSATIONAL,
         )
-        
-        # Estimate tokens
-        estimated_tokens = len(self.encoder.encode(content.text))
-        estimated_tokens += 500  # Overhead
-        
-        # Groq is FREE, so cost is 0!
-        estimated_cost = 0.0
-        
+
+        # Token estimation (safe)
+        estimated_tokens = (
+            len(self.encoder.encode(content.text)) if content.text else 0
+        ) + 300
+
         return ExecutionPlan(
             task_type=task_type,
-            steps=plan_data.get("suggested_steps", ["Process content"]),
+            steps=plan_data.get("suggested_steps", []),
             estimated_tokens=estimated_tokens,
-            estimated_cost=estimated_cost,
+            estimated_cost=0.0,  # Groq FREE
             requires_clarification=plan_data.get("requires_clarification", False),
             clarification_question=plan_data.get("clarification_question"),
             reasoning=plan_data.get("reasoning", "No reasoning provided"),
             metadata={
                 "content_length": len(content.text),
-                "input_type": content.input_type,
-                "free_api": True  # Groq is FREE!
-            }
+                "extraction_method": content.extraction_method,
+                "free_api": True,
+            },
         )

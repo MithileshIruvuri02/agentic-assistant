@@ -4,7 +4,6 @@ from typing import Optional
 from fastapi import UploadFile
 import magic
 from loguru import logger
-from tenacity import RetryError
 
 from app.models.schemas import InputType, ExtractedContent
 from app.services.ocr_service import OCRService
@@ -15,7 +14,7 @@ from app.config import get_settings
 
 
 class InputProcessor:
-    """Processes different types of input and extracts content."""
+    """Processes different input types and extracts usable content."""
 
     def __init__(self):
         self.settings = get_settings()
@@ -25,8 +24,7 @@ class InputProcessor:
         self.youtube_service = YouTubeService()
 
         self.youtube_patterns = [
-            r"(?:https?:\/\/)?(?:www\.)?youtube\.com\/watch\?v=([^\s&]+)",
-            r"(?:https?:\/\/)?youtu\.be\/([^\s&]+)",
+            r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)([^\s&]+)'
         ]
 
     async def process(
@@ -52,97 +50,89 @@ class InputProcessor:
 
         raise ValueError("No valid input provided")
 
+    # ---------- YouTube ----------
+
     def _is_youtube_url(self, text: str) -> bool:
         return any(re.search(p, text, re.IGNORECASE) for p in self.youtube_patterns)
 
     async def _process_youtube(self, text: str) -> ExtractedContent:
-        logger.info("Processing YouTube URL")
+        logger.info("🎬 Processing YouTube URL")
 
         video_id = None
         for pattern in self.youtube_patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                video_id = match.group(1)
+                video_id = match.group(1).split("&")[0]
                 break
 
         if not video_id:
-            return ExtractedContent(
-                text=text,
-                input_type=InputType.TEXT,
-                extraction_method="youtube_failed",
-                metadata={"error": "Invalid YouTube URL"},
-            )
+            raise ValueError("Could not extract YouTube video ID")
 
-        try:
-            transcript = await self.youtube_service.get_transcript(video_id)
+        transcript = await self.youtube_service.get_transcript(video_id)
 
+        # ✅ SUCCESS
+        if transcript.get("success"):
             return ExtractedContent(
                 text=transcript["text"],
                 input_type=InputType.TEXT,
                 extraction_method="youtube_transcript",
+                confidence=0.9,
                 metadata={
                     "video_id": video_id,
-                    "duration_seconds": transcript.get("duration"),
-                    "language": transcript.get("language", "unknown"),
+                    "duration_seconds": transcript["duration"],
+                    "language": transcript["language"],
                 },
             )
 
-        except (RetryError, Exception) as e:
-            logger.warning(f"YouTube transcript unavailable: {e}")
+        # ✅ GRACEFUL FALLBACK (NO CRASH)
+        return ExtractedContent(
+            text=(
+                "🤔 I couldn’t access captions for this YouTube video. "
+                "Please upload the transcript, enable captions, or upload the audio/video file."
+            ),
+            input_type=InputType.TEXT,
+            extraction_method="youtube_failed",
+            confidence=0.0,
+            metadata={
+                "video_id": video_id,
+                "error": transcript.get("error"),
+            },
+        )
 
-            return ExtractedContent(
-                text=text,
-                input_type=InputType.TEXT,
-                extraction_method="youtube_failed",
-                metadata={
-                    "video_id": video_id,
-                    "error": "Transcript unavailable",
-                },
-            )
+    # ---------- File handling ----------
 
     async def _process_file(self, file: UploadFile) -> ExtractedContent:
         content = await file.read()
         file_ext = Path(file.filename).suffix.lower()
         mime_type = magic.from_buffer(content, mime=True)
 
+        logger.info(f"Processing file | {file.filename} | {mime_type}")
+
         if mime_type.startswith("image/"):
-            return await self._process_image(content, file.filename)
+            result = await self.ocr_service.extract_text(content)
+            return ExtractedContent(
+                text=result["text"],
+                input_type=InputType.IMAGE,
+                confidence=result["confidence"],
+                extraction_method="ocr",
+            )
 
         if mime_type == "application/pdf":
-            return await self._process_pdf(content, file.filename)
+            result = await self.pdf_service.extract_text(content)
+            return ExtractedContent(
+                text=result["text"],
+                input_type=InputType.PDF,
+                confidence=result.get("confidence"),
+                extraction_method=result["method"],
+            )
 
         if mime_type.startswith("audio/"):
-            return await self._process_audio(content, file.filename)
+            result = await self.audio_service.transcribe(content, file.filename)
+            return ExtractedContent(
+                text=result["text"],
+                input_type=InputType.AUDIO,
+                confidence=result.get("confidence"),
+                extraction_method="whisper_api",
+            )
 
         raise ValueError(f"Unsupported file type: {mime_type}")
-
-    async def _process_image(self, content: bytes, filename: str) -> ExtractedContent:
-        result = await self.ocr_service.extract_text(content)
-
-        return ExtractedContent(
-            text=result["text"],
-            input_type=InputType.IMAGE,
-            confidence=result.get("confidence"),
-            extraction_method="ocr",
-            metadata={"filename": filename},
-        )
-
-    async def _process_pdf(self, content: bytes, filename: str) -> ExtractedContent:
-        result = await self.pdf_service.extract_text(content)
-
-        return ExtractedContent(
-            text=result["text"],
-            input_type=InputType.PDF,
-            extraction_method=result["method"],
-            metadata={"filename": filename},
-        )
-
-    async def _process_audio(self, content: bytes, filename: str) -> ExtractedContent:
-        result = await self.audio_service.transcribe(content, filename)
-
-        return ExtractedContent(
-            text=result["text"],
-            input_type=InputType.AUDIO,
-            extraction_method="whisper",
-            metadata={"filename": filename},
-        )
