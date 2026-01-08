@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agentic Assistant</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 Agentic Assistant</h1>
+            <p>Intelligent agent that processes text, images, PDFs, and audio</p>
+        </div>
+
+        <div class="chat-container" id="chatContainer">
+            <div class="welcome-message">
+                <h2>Welcome! 👋</h2>
+                <p>I can help you with:</p>
+                <ul>
+                    <li>📝 Extract text from images and PDFs</li>
+                    <li>🎬 Fetch YouTube transcripts</li>
+                    <li>📊 Summarize content</li>
+                    <li>💭 Analyze sentiment</li>
+                    <li>💻 Explain code</li>
+                    <li>💬 Answer questions</li>
+                </ul>
+                <p><strong>Just send me a message or upload a file to get started!</strong></p>
+            </div>
+        </div>
+
+        <div class="input-container">
+            <form id="inputForm" enctype="multipart/form-data">
+                <div class="file-upload-area" id="fileUploadArea">
+                    <input type="file" id="fileInput" accept=".jpg,.jpeg,.png,.pdf,.mp3,.wav,.m4a" hidden>
+                    <button type="button" id="fileButton" class="file-button" title="Upload file">
+                        📎
+                    </button>
+                    <span id="fileName" class="file-name"></span>
+                </div>
+                
+                <textarea 
+                    id="textInput" 
+                    placeholder="Type your message or question here..." 
+                    rows="1"
+                ></textarea>
+                
+                <button type="submit" id="sendButton" class="send-button">
+                    ➤
+                </button>
+            </form>
+        </div>
+
+        <div class="cost-display" id="costDisplay">
+            Total Cost: $<span id="totalCost">0.0000</span>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
